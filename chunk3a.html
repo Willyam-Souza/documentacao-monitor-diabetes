@@ -1,0 +1,781 @@
+<script>
+    const dictionaryData = [
+        { group: "Identifica\u00e7\u00e3o e demografia" },
+        {
+            field: "id_paciente",
+            type: "STRING",
+            desc: "Identificador único do paciente (CPF na base SMS).",
+            detail: "Extraído de ficha_a.cpf. Sanitizado com REGEXP_REPLACE para remover não-dígitos. Chave de junção entre todas as CTEs."
+        },
+        {
+            field: "nome",
+            type: "STRING",
+            desc: "Nome completo do paciente.",
+            detail: "Origem: ficha_a.nome. Selecionado pelo cadastro mais recente (data_atualizacao_cadastro DESC)."
+        },
+        {
+            field: "genero",
+            type: "STRING",
+            desc: "Gênero do paciente.",
+            detail: "Origem: ficha_a.sexo (alias genero). Filtro: apenas cadastros permanentes e ativos."
+        },
+        {
+            field: "idade",
+            type: "INTEGER",
+            desc: "Idade calculada no momento da extração.",
+            detail: "Calculada via DATE_DIFF(CURRENT_DATE(), f.data_nascimento, YEAR). Usada na definição de metas clínicas (HbA1c <60 anos → 7.0%, ≥60 → 7.5%; PA ≥80 anos → meta 150 mmHg)."
+        },
+        {
+            field: "data_nascimento",
+            type: "DATE",
+            desc: "Data de nascimento do paciente.",
+            detail: "Origem: ficha_a.data_nascimento. Usada para calcular idade e classificar DM1 provável (diagnóstico antes dos 35 anos + insulina exclusiva)."
+        },
+        {
+            field: "raca",
+            type: "STRING",
+            desc: "Raça/Cor autodeclarada.",
+            detail: "Origem: ficha_a.raca_cor (alias raca). Cadastro Ficha A."
+        },
+        {
+            field: "id_ine_cadastro",
+            type: "STRING",
+            desc: "Código INE da equipe ESF vinculada.",
+            detail: "Origem: ficha_a.ine_equipe. Filtro aplicado: NOT REGEXP_CONTAINS(equipe_nome, 'ESB') AND ine_equipe IS NOT NULL."
+        },
+        {
+            field: "nome_esf_cadastro",
+            type: "STRING",
+            desc: "Nome da equipe ESF de vinculação.",
+            detail: "Origem: ficha_a.equipe_nome."
+        },
+        {
+            field: "id_cnes_cadastro",
+            type: "STRING",
+            desc: "Código CNES da unidade de saúde.",
+            detail: "Origem: ficha_a.unidade_cadastro."
+        },
+        {
+            field: "nome_clinica_cadastro",
+            type: "STRING",
+            desc: "Nome da unidade de saúde cadastrada.",
+            detail: "Origem: ficha_a.unidade_nome."
+        },
+        {
+            field: "nome_medico_esf_cadastro",
+            type: "STRING",
+            desc: "Nome do médico responsável pela equipe.",
+            detail: "Origem: paciente.equipe_saude_familia[0].medicos[0].nome. JOIN com tabela saude_historico_clinico.paciente via CPF."
+        },
+        {
+            field: "nome_enfermeiro_esf_cadastro",
+            type: "STRING",
+            desc: "Nome do enfermeiro responsável pela equipe.",
+            detail: "Origem: paciente.equipe_saude_familia[0].enfermeiros[0].nome."
+        },
+        {
+            field: "area_programatica_cadastro",
+            type: "STRING",
+            desc: "Área Programática (AP) da unidade de saúde.",
+            detail: "Origem: ficha_a.ap_cadastro."
+        },
+
+        { group: "Diabetes mellitus" },
+        {
+            field: "pre_DM",
+            type: "DATE",
+            desc: "Data de identificação de Pré-Diabetes.",
+            detail: "Calculada em has_dm_consolidado: data de pre_dm_por_exames somente quando nenhum critério diagnóstico de DM é atingido. Critério laboratorial: glicemia entre 100-125 mg/dL ou HbA1c entre 5.7-6.4% em pelo menos 2 medidas (ARRAY_AGG[SAFE_OFFSET(1)])."
+        },
+        {
+            field: "DM",
+            type: "DATE",
+            desc: "Data consolidada do diagnóstico de Diabetes Mellitus.",
+            detail: "MIN entre: dm_por_cid, dm_por_exames, dm_por_progressao_pre_dm e dm_por_medicamento_forte. Exceto se apenas metformina e sem outras evidências (tem_apenas_metformina = TRUE)."
+        },
+        {
+            field: "dm_por_cid",
+            type: "DATE",
+            desc: "Data de identificação de DM baseada em CID.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) onde CID ∈ regex ^(E1[0-4]|O24|H360|H280|G632|G590|G990|N083|M142)."
+        },
+        {
+            field: "dm_por_exames",
+            type: "DATE",
+            desc: "Data de identificação de DM por exames laboratoriais.",
+            detail: "CTE criterios_dm_medidas: MIN(data_coleta) onde glicemia ≥ 126 OU hba1c ≥ 6.5. Fonte: todas_medidas_glicemia (vitacare + episodio_assistencial via tabela PA_A1C_glic_cpf_fix)."
+        },
+        {
+            field: "dm_por_progressao_pre_dm",
+            type: "DATE",
+            desc: "Data de progressão de pré-DM para DM.",
+            detail: "CTE criterios_dm_medidas: 2ª medida com glicemia 100-125 ou HbA1c 5.7-6.4, obtida via ARRAY_AGG[SAFE_OFFSET(1)] ORDER BY data_coleta."
+        },
+        {
+            field: "dm_por_medicamento_forte",
+            type: "DATE",
+            desc: "Identificação por antidiabéticos orais/insulina.",
+            detail: "CTE criterios_dm_medicamentos: MIN(entrada_data) com REGEXP_CONTAINS no nome do medicamento detectando: GLICLAZIDA, GLIBENCLAMIDA, GLIMEPIRID, GLIPIZIDA, REPAGLINIDA, NATEGLINIDA, PIOGLITAZONA, SITAGLIPTINA, VILDAGLIPTINA, SAXAGLIPTINA, LINAGLIPTINA, EXENATIDA, DULAGLUTIDA, LIXISENATIDA, TIRZEPATIDA, INSULINA e análogos."
+        },
+        {
+            field: "DM_sem_CID",
+            type: "BOOLEAN",
+            desc: "Paciente com critérios clínicos para DM sem CID registrado.",
+            detail: "TRUE quando dm_por_cid IS NULL AND (dm_por_exames IS NOT NULL OR dm_por_progressao_pre_dm IS NOT NULL OR dm_por_medicamento_forte IS NOT NULL)."
+        },
+        {
+            field: "provavel_dm1",
+            type: "BOOLEAN",
+            desc: "Classificação provável de Diabetes Tipo 1.",
+            detail: "TRUE se: (a) CID E10 explícito, OU (b) insulina_exclusiva = TRUE AND diagnóstico antes dos 35 anos. CTE classificacao_tipo_dm: insulina_exclusiva quando usa insulina/análogos SEM antidiabéticos orais."
+        },
+        {
+            field: "hba1c_atual",
+            type: "FLOAT",
+            desc: "Último valor de Hemoglobina Glicada (HbA1c).",
+            detail: "CTE hba1c_progressao: valor atual após QUALIFY ROW_NUMBER() OVER (PARTITION BY cpf ORDER BY data_coleta DESC, id_hci DESC) = 1. Fontes: vitacare (cod_exame='HGL', unidade='%', valor entre 3-20) + científica lab. Filtros aplicados: resultado entre 3 e 20, unidade '%'."
+        },
+        {
+            field: "data_hba1c_atual",
+            type: "DATE",
+            desc: "Data da última coleta de HbA1c.",
+            detail: "CTE hba1c_progressao: data_coleta da medida mais recente."
+        },
+        {
+            field: "hba1c_anterior",
+            type: "FLOAT",
+            desc: "Valor da penúltima HbA1c registrada.",
+            detail: "CTE hba1c_progressao: LAG(hba1c) OVER (PARTITION BY cpf ORDER BY data_coleta, id_hci)."
+        },
+        {
+            field: "data_hba1c_anterior",
+            type: "DATE",
+            desc: "Data da penúltima coleta de HbA1c.",
+            detail: "CTE hba1c_progressao: LAG(data_coleta) OVER (PARTITION BY cpf ORDER BY data_coleta)."
+        },
+        {
+            field: "dias_entre_hba1c",
+            type: "INTEGER",
+            desc: "Dias entre as duas últimas coletas de HbA1c.",
+            detail: "CTE progressao_glicemica: DATE_DIFF(data_hba1c_atual, data_hba1c_anterior, DAY)."
+        },
+        {
+            field: "dias_desde_ultima_hba1c",
+            type: "INTEGER",
+            desc: "Dias desde a última coleta de HbA1c.",
+            detail: "CTE resumo_controle_glicemia_dias: DATE_DIFF(CURRENT_DATE(), MAX(data_coleta), DAY)."
+        },
+        {
+            field: "tendencia_hba1c",
+            type: "STRING",
+            desc: "Variação clínica (Melhorando, Piorando, Estável).",
+            detail: "CTE progressao_glicemica: para pacientes COM DM fora da meta → 'melhorando' se hba1c_atual < hba1c_anterior - 0.4; 'piorando' se > anterior + 0.4; 'estavel' caso contrário. Pacientes controlados → sempre 'estavel'. Sem DM → classificação de rastreio."
+        },
+        {
+            field: "meta_hba1c",
+            type: "FLOAT",
+            desc: "Meta clínica de HbA1c para o paciente.",
+            detail: "CTE progressao_glicemica: idade < 60 → 7.0; idade ≥ 60 → 7.5. Idosos ≥70 com hba1c < 6.0 são classificados como 'abaixo_da_meta'."
+        },
+        {
+            field: "status_controle_glicemico",
+            type: "STRING",
+            desc: "Status geral atual: 'Controlado' ou 'Descontrolado'.",
+            detail: "CTE progressao_glicemica: pacientes COM DM → 'dentro_da_meta', 'fora_da_meta' ou 'abaixo_da_meta'. Sem DM → prefixo 'rastreio - normal/pre_diabetes/provável_diabetes'."
+        },
+        {
+            field: "DM_controlado",
+            type: "BOOLEAN",
+            desc: "HbA1c dentro da meta estabelecida.",
+            detail: "Derivado de status_controle_glicemico = 'dentro_da_meta'."
+        },
+        {
+            field: "DM_piorando",
+            type: "BOOLEAN",
+            desc: "HbA1c atual maior que o anterior de forma clinicamente significativa.",
+            detail: "Derivado de tendencia_hba1c = 'piorando' (diferença > 0.4%)."
+        },
+        {
+            field: "DM_melhorando",
+            type: "BOOLEAN",
+            desc: "HbA1c atual menor que o anterior.",
+            detail: "Derivado de tendencia_hba1c = 'melhorando' (diferença > 0.4%)."
+        },
+        {
+            field: "dias_dm_controlado",
+            type: "INTEGER",
+            desc: "Total de dias históricos com HbA1c na meta.",
+            detail: "CTE resumo_controle_glicemia_dias: SUM(dias_ate_proxima) WHERE status_periodo = 'controlado'. Calculado via historico_controle_glicemia que usa LEAD() para períodos entre medições desde o diagnóstico."
+        },
+        {
+            field: "dias_dm_descontrolado",
+            type: "INTEGER",
+            desc: "Total de dias históricos com HbA1c fora da meta.",
+            detail: "CTE resumo_controle_glicemia_dias: SUM(dias_ate_proxima) WHERE status_periodo = 'descontrolado'."
+        },
+        {
+            field: "pct_dias_dm_controlado",
+            type: "FLOAT",
+            desc: "Percentual histórico do tempo na meta glicêmica.",
+            detail: "CTE resumo_controle_glicemia: ROUND(dias_dm_controlado * 100.0 / NULLIF(dias_dm_controlado + dias_dm_descontrolado, 0), 1)."
+        },
+        {
+            field: "dias_dm_controlado_365d",
+            type: "INTEGER",
+            desc: "Dias na meta no último ano (365 dias).",
+            detail: "CTE resumo_controle_glicemia_dias: cálculo por período considerando sobreposição de janelas de medição com a janela de 365 dias usando lógica de CASE com datas de início/fim de período."
+        },
+        {
+            field: "dias_dm_descontrolado_365d",
+            type: "INTEGER",
+            desc: "Dias fora da meta no último ano.",
+            detail: "Mesmo cálculo de dias_dm_controlado_365d para status_periodo = 'descontrolado'."
+        },
+        {
+            field: "pct_dias_dm_controlado_365d",
+            type: "FLOAT",
+            desc: "Percentual do último ano dentro da meta glicêmica.",
+            detail: "ROUND(dias_dm_controlado_365d * 100.0 / NULLIF(dias_dm_controlado_365d + dias_dm_descontrolado_365d, 0), 1)."
+        },
+        {
+            field: "glicemia",
+            type: "FLOAT",
+            desc: "Último valor de Glicemia de Jejum.",
+            detail: "CTE exames_pivot: COALESCE de cod_exame 'GLI' e 'GLU'. Filtro: valor entre 30 e 500 mg/dL. Fontes: exames_historico (saude_historico_clinico.exame) + exames_cientifica (brutos_cientificalab)."
+        },
+        {
+            field: "data_glicemia",
+            type: "DATE",
+            desc: "Data da última Glicemia.",
+            detail: "CTE exames_pivot: data_glicemia via COALESCE de datas dos códigos GLI e GLU."
+        },
+        {
+            field: "dias_desde_ultima_glicemia",
+            type: "INTEGER",
+            desc: "Dias desde o último exame de Glicemia.",
+            detail: "CTE exames_pivot: DATE_DIFF(CURRENT_DATE(), data_glicemia, DAY)."
+        },
+        {
+            field: "ultimas_tres_glicemias",
+            type: "STRING",
+            desc: "3 últimos resultados de glicemia.",
+            detail: "CTE ultimas_medidas_glicemia: STRING_AGG(CONCAT(CAST(ROUND(glicemia) AS STRING), ' mg/dL'), ';' ORDER BY data_coleta DESC) para rn <= 3."
+        },
+        {
+            field: "ultimas_tres_A1C",
+            type: "STRING",
+            desc: "3 últimos resultados de HbA1c.",
+            detail: "CTE ultimas_medidas_glicemia: STRING_AGG(CONCAT(CAST(ROUND(hba1c,1) AS STRING), '%'), ';' ORDER BY data_coleta DESC) para rn <= 3."
+        },
+
+        { group: "Hipertens\u00e3o arterial" },
+        {
+            field: "HAS",
+            type: "DATE",
+            desc: "Data consolidada do diagnóstico de Hipertensão Arterial.",
+            detail: "CTE has_dm_consolidado: MIN entre has_por_cid, has_por_medida_critica, has_por_medidas_repetidas, has_por_medicamento."
+        },
+        {
+            field: "has_por_cid",
+            type: "DATE",
+            desc: "Data de identificação de HAS baseada em CID.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^(I1[0-6]|O1[01])."
+        },
+        {
+            field: "has_por_medida_critica",
+            type: "DATE",
+            desc: "Identificação por medida isolada extremamente elevada.",
+            detail: "CTE criterios_has_medidas: MIN(data_medicao) onde PAS ≥ 180 OU PAD ≥ 110. Fonte: PA_A1C_glic_cpf_fix (valores corrigidos)."
+        },
+        {
+            field: "has_por_medidas_repetidas",
+            type: "DATE",
+            desc: "Identificação por múltiplas aferições elevadas.",
+            detail: "CTE criterios_has_medidas: 2ª medida com PAS 140-179 ou PAD 90-109 via ARRAY_AGG[SAFE_OFFSET(1)] ORDER BY data_medicao."
+        },
+        {
+            field: "has_por_medicamento",
+            type: "DATE",
+            desc: "Identificação pelo uso de anti-hipertensivos.",
+            detail: "CTE criterios_has_medicamentos: MIN(entrada_data) com REGEXP_CONTAINS detectando: HIDROCLOROTIAZIDA, CLORTALIDONA, CAPTOPRIL, ENALAPRIL, LISINOPRIL, RAMIPRIL, LOSARTANA, VALSARTANA, ANLODIPINO, NIFEDIPINO, ATENOLOL, METOPROLOL, CARVEDILOL, METILDOPA, entre outros."
+        },
+        {
+            field: "HAS_sem_CID",
+            type: "BOOLEAN",
+            desc: "Paciente com critérios para HAS sem CID.",
+            detail: "TRUE quando has_por_cid IS NULL AND (has_por_medida_critica IS NOT NULL OR has_por_medidas_repetidas IS NOT NULL OR has_por_medicamento IS NOT NULL)."
+        },
+        {
+            field: "pressao_sistolica",
+            type: "FLOAT",
+            desc: "Última aferição de Pressão Sistólica (PAS).",
+            detail: "CTE pa_progressao: pas_atual após QUALIFY ROW_NUMBER() OVER (PARTITION BY cpf ORDER BY entrada_data DESC, id_hci DESC) = 1. Valores de COALESCE(fix.PAS_fix, ea.medidas.pressao_sistolica)."
+        },
+        {
+            field: "pressao_diastolica",
+            type: "FLOAT",
+            desc: "Última aferição de Pressão Diastólica (PAD).",
+            detail: "CTE pa_progressao: pad_atual. COALESCE(fix.PAD_fix, ea.medidas.pressao_diastolica)."
+        },
+        {
+            field: "data_ultima_pa",
+            type: "DATE",
+            desc: "Data da última aferição de pressão.",
+            detail: "CTE pa_progressao: data_pa_atual."
+        },
+        {
+            field: "dias_desde_ultima_pa",
+            type: "INTEGER",
+            desc: "Dias desde a última aferição de PA.",
+            detail: "DATE_DIFF(CURRENT_DATE(), data_pa_atual, DAY)."
+        },
+        {
+            field: "meta_pas",
+            type: "INTEGER",
+            desc: "Meta terapêutica para pressão sistólica.",
+            detail: "CTE progressao_pressao: idade ≥ 80 → 150 mmHg; demais → 140 mmHg."
+        },
+        {
+            field: "meta_pad",
+            type: "INTEGER",
+            desc: "Meta terapêutica para pressão diastólica.",
+            detail: "Fixo em 90 mmHg para todos os pacientes."
+        },
+        {
+            field: "status_controle_pressorio",
+            type: "STRING",
+            desc: "Status geral: 'Controlado' ou 'Descontrolado'.",
+            detail: "CTE progressao_pressao: pacientes COM HAS → 'controlado' se PAS < meta_pas AND PAD < 90; caso contrário 'descontrolado'. Sem HAS → categorias de rastreio."
+        },
+        {
+            field: "tendencia_pa",
+            type: "STRING",
+            desc: "Variação das últimas medidas de pressão.",
+            detail: "CTE progressao_pressao: para pacientes COM HAS descontrolados → 'melhorando' se PAS_atual < PAS_anterior - 5; 'piorando' se > anterior + 5; 'estavel' caso contrário. Controlados → sempre 'estavel'."
+        },
+        {
+            field: "ultimas_tres_PA",
+            type: "STRING",
+            desc: "3 últimas aferições de PA registradas.",
+            detail: "CTE ultimas_medidas_pa: STRING_AGG(CONCAT(PAS,'/',PAD,' mmHg'), ';' ORDER BY entrada_data DESC) para rn <= 3."
+        },
+
+        { group: "Antropometria" },
+        {
+            field: "peso",
+            type: "FLOAT",
+            desc: "Último peso registrado (kg).",
+            detail: "CTE ultimas_medidas_antropometricas: COALESCE de vitacare (indicadores_vitacare_fix.peso_fix) e episodio_assistencial (medidas.peso). Prioriza mais recente via ROW_NUMBER() OVER (PARTITION BY cpf ORDER BY COALESCE(data_peso, data_altura) DESC)."
+        },
+        {
+            field: "data_peso",
+            type: "DATE",
+            desc: "Data do último registro de peso.",
+            detail: "Obtida da mesma CTE ultimas_medidas_antropometricas, do registro mais recente."
+        },
+        {
+            field: "altura",
+            type: "FLOAT",
+            desc: "Última altura registrada (m).",
+            detail: "CTE ultimas_medidas_antropometricas: mesma lógica do peso, com campo altura_fix (vitacare) ou medidas.altura (episodio)."
+        },
+        {
+            field: "data_altura",
+            type: "DATE",
+            desc: "Data do último registro de altura.",
+            detail: "Data do registro mais recente de altura."
+        },
+        {
+            field: "IMC",
+            type: "FLOAT",
+            desc: "Índice de Massa Corporal calculado.",
+            detail: "CTE ultimas_medidas_antropometricas: ROUND(peso / POWER(altura, 2), 1). Calculado apenas quando altura > 0."
+        },
+        {
+            field: "obesidade_por_IMC",
+            type: "BOOLEAN",
+            desc: "IMC atual >= 30.",
+            detail: "CASE WHEN imc_fix >= 30 THEN TRUE ELSE FALSE END. Avaliado na CTE de medidas antropométricas."
+        },
+        {
+            field: "obesidade",
+            type: "DATE",
+            desc: "Data do diagnóstico de obesidade por CID.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^E66."
+        },
+        {
+            field: "obesidade_consolidada",
+            type: "DATE",
+            desc: "Diagnóstico unificado de obesidade (CID ou IMC).",
+            detail: "COALESCE entre obesidade (CID E66) e data do primeiro registro com IMC ≥ 30."
+        },
+
+        { group: "Laboratorial / lip\u00eddios" },
+        {
+            field: "colesterol_total",
+            type: "FLOAT",
+            desc: "Último valor de Colesterol Total.",
+            detail: "CTE exames_pivot: cod_exame = 'COL'. Filtro: resultado entre 50 e 600 mg/dL. Fontes: exames_historico + exames_cientifica."
+        },
+        {
+            field: "data_colesterol",
+            type: "DATE",
+            desc: "Data do exame de Colesterol.",
+            detail: "CTE exames_pivot: data_colesterol."
+        },
+        {
+            field: "hdl",
+            type: "FLOAT",
+            desc: "Último valor de HDL.",
+            detail: "CTE exames_pivot: cod_exame = 'HDL'. Filtro: resultado entre 10 e 150 mg/dL."
+        },
+        {
+            field: "data_hdl",
+            type: "DATE",
+            desc: "Data do exame de HDL.",
+            detail: "CTE exames_pivot: data_hdl."
+        },
+        {
+            field: "ldl",
+            type: "FLOAT",
+            desc: "Último valor de LDL.",
+            detail: "CTE exames_pivot: cod_exame = 'LDL'. Filtro: resultado entre 20 e 400 mg/dL."
+        },
+        {
+            field: "data_ldl",
+            type: "DATE",
+            desc: "Data do exame de LDL.",
+            detail: "CTE exames_pivot: data_ldl."
+        },
+        {
+            field: "triglicerides",
+            type: "FLOAT",
+            desc: "Último valor de Triglicerídeos.",
+            detail: "CTE exames_pivot: cod_exame = 'TRI'. Filtro: resultado entre 20 e 1000 mg/dL."
+        },
+        {
+            field: "classificacao_colesterol_total",
+            type: "STRING",
+            desc: "Classificação clínica do Colesterol Total.",
+            detail: "Calculada com base nos limites da SBC. Valores: Normal (<200), Limítrofe (200-239), Alto (≥240)."
+        },
+        {
+            field: "classificacao_hdl",
+            type: "STRING",
+            desc: "Classificação clínica do HDL.",
+            detail: "Baixo (<40 homens / <50 mulheres), Normal, Alto."
+        },
+        {
+            field: "classificacao_ldl",
+            type: "STRING",
+            desc: "Classificação clínica do LDL.",
+            detail: "Conforme estratificação de risco cardiovascular (Ótimo <100, Desejável 100-129, Limítrofe 130-159, Alto 160-189, Muito Alto ≥190)."
+        },
+        {
+            field: "classificacao_triglicerides",
+            type: "STRING",
+            desc: "Classificação clínica dos Triglicerídeos.",
+            detail: "Normal (<150), Limítrofe (150-199), Alto (200-499), Muito Alto (≥500)."
+        },
+        {
+            field: "dislipidemia",
+            type: "DATE",
+            desc: "Data consolidada de diagnóstico de Dislipidemia.",
+            detail: "MIN entre dislipidemia_por_CID e primeira data com critério laboratorial."
+        },
+        {
+            field: "dislipidemia_por_CID",
+            type: "DATE",
+            desc: "Dislipidemia por CID.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^E78."
+        },
+        {
+            field: "dislipidemia_por_CT",
+            type: "BOOLEAN",
+            desc: "Critério laboratorial de Colesterol Total elevado.",
+            detail: "Colesterol Total ≥ 200 mg/dL."
+        },
+        {
+            field: "dislipidemia_por_LDL",
+            type: "BOOLEAN",
+            desc: "Critério laboratorial de LDL elevado.",
+            detail: "LDL ≥ 130 mg/dL."
+        },
+        {
+            field: "dislipidemia_por_HDL_baixo",
+            type: "BOOLEAN",
+            desc: "Critério laboratorial de HDL baixo.",
+            detail: "HDL < 40 mg/dL."
+        },
+        {
+            field: "dislipidemia_por_TG",
+            type: "BOOLEAN",
+            desc: "Critério laboratorial de Triglicerídeos elevados.",
+            detail: "Triglicerídeos ≥ 150 mg/dL."
+        },
+        {
+            field: "risco_cardiovascular",
+            type: "STRING",
+            desc: "Estrato de risco (Baixo, Intermediário, Alto).",
+            detail: "Calculado via Escore de Framingham / critérios SBC. Integrado na tabela de origem (MM_2026_novos_cadastros)."
+        },
+
+        { group: "Renal / stopp-start" },
+        {
+            field: "creatinina",
+            type: "FLOAT",
+            desc: "Último valor de Creatinina sérica.",
+            detail: "CTE exames_pivot: cod_exame = 'CRE'. Filtros: resultado entre 0.2 e 15 AND unidade = 'mg/dL'. Fontes: exames_historico + exames_cientifica."
+        },
+        {
+            field: "data_creatinina",
+            type: "DATE",
+            desc: "Data do último exame de creatinina.",
+            detail: "CTE exames_pivot: data_creatinina."
+        },
+        {
+            field: "egfr",
+            type: "FLOAT",
+            desc: "Taxa de filtração glomerular estimada.",
+            detail: "Fórmula CKD-EPI 2021, calculada a partir da creatinina e dados demográficos (idade, sexo). Integrado na tabela base MM_2026_novos_cadastros."
+        },
+        {
+            field: "ckd_stage",
+            type: "STRING",
+            desc: "Estágio de Doença Renal Crônica (G1 a G5 - KDIGO).",
+            detail: "Baseado no eGFR: G1 (≥90), G2 (60-89), G3a (45-59), G3b (30-44), G4 (15-29), G5 (<15)."
+        },
+        {
+            field: "IRC",
+            type: "DATE",
+            desc: "Data consolidada do diagnóstico de Insuficiência Renal Crônica.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^(I120|I131|N03[2-7]|N05[2-7]|N1[89]|N250|Z49[0-2]|Z940|Z992)."
+        },
+        {
+            field: "necessita_funcao_renal",
+            type: "BOOLEAN",
+            desc: "Paciente necessita avaliação renal.",
+            detail: "TRUE quando paciente tem HAS ou DM e não tem creatinina recente."
+        },
+        {
+            field: "lacuna_creatinina_HAS_DM",
+            type: "BOOLEAN",
+            desc: "Paciente com HAS/DM sem creatinina recente.",
+            detail: "TRUE quando (HAS IS NOT NULL OR DM IS NOT NULL) AND (data_creatinina IS NULL OR dias_desde_exame > threshold)."
+        },
+        {
+            field: "lacuna_IRC_sem_SGLT2",
+            type: "BOOLEAN",
+            desc: "Regra START: IRC sem glifozina.",
+            detail: "TRUE quando IRC IS NOT NULL AND (data_ultima_SGLT2 IS NULL OR dias_desde_ultima_SGLT2 > 180). CTE ultimas_prescricoes_medicamentos: REGEXP_CONTAINS detectando DAPAGLIFLOZINA, FORXIGA, EMPAGLIFLOZINA, JARDIANCE, CANAGLIFLOZINA, INVOKANA, SOTAGLIFLOZINA."
+        },
+        {
+            field: "lacuna_IRC_sem_iECA_ou_BRA",
+            type: "BOOLEAN",
+            desc: "Regra START: IRC sem nefroproteção com iECA/BRA.",
+            detail: "TRUE quando IRC IS NOT NULL AND data_ultima_IECA IS NULL AND data_ultima_BRA IS NULL. CTE ultimas_prescricoes_medicamentos identifica iECA (CAPTOPRIL, ENALAPRIL, LISINOPRIL, RAMIPRIL, etc.) e BRA (LOSARTANA, VALSARTANA, CANDESARTANA, etc.)."
+        },
+        {
+            field: "data_ultima_SGLT2",
+            type: "DATE",
+            desc: "Data da última prescrição de glifozina.",
+            detail: "CTE ultimas_prescricoes_medicamentos: MAX(entrada_data) com REGEXP_CONTAINS(UPPER(presc.nome), r'(DAPAGLIFLOZINA|FORXIGA|EMPAGLIFLOZINA|JARDIANCE|CANAGLIFLOZINA|INVOKANA|SOTAGLIFLOZINA)')."
+        },
+        {
+            field: "dias_desde_ultima_SGLT2",
+            type: "INTEGER",
+            desc: "Dias sem prescrição ativa de glifozina.",
+            detail: "DATE_DIFF(CURRENT_DATE(), data_ultima_SGLT2, DAY)."
+        },
+        {
+            field: "lacuna_DM_complicado_sem_SGLT2",
+            type: "BOOLEAN",
+            desc: "Regra START: DM com doença cardiovascular sem glifozina.",
+            detail: "TRUE quando DM IS NOT NULL AND (CI IS NOT NULL OR ICC IS NOT NULL) AND (data_ultima_SGLT2 IS NULL OR dias > threshold)."
+        },
+
+        { group: "P\u00e9 diab\u00e9tico" },
+        {
+            field: "teve_exame_pe_365d",
+            type: "BOOLEAN",
+            desc: "Realizou exame do pé nos últimos 365 dias.",
+            detail: "Verificado em episodio_assistencial por tipo de procedimento/CID relacionado a avaliação de pé diabético."
+        },
+        {
+            field: "teve_exame_pe_180d",
+            type: "BOOLEAN",
+            desc: "Realizou exame do pé nos últimos 180 dias.",
+            detail: "Mesmo critério com janela de 180 dias."
+        },
+        {
+            field: "data_ultimo_exame_pe",
+            type: "DATE",
+            desc: "Data exata do último exame dos pés.",
+            detail: "MAX(entrada_data) de episódios com procedimento de avaliação do pé diabético."
+        },
+        {
+            field: "dias_desde_ultimo_exame_pe",
+            type: "INTEGER",
+            desc: "Dias sem avaliação do pé diabético.",
+            detail: "DATE_DIFF(CURRENT_DATE(), data_ultimo_exame_pe, DAY)."
+        },
+        {
+            field: "lacuna_DM_sem_exame_pe_365d",
+            type: "BOOLEAN",
+            desc: "DM sem exame do pé há mais de um ano.",
+            detail: "DM IS NOT NULL AND (data_ultimo_exame_pe IS NULL OR dias_desde_ultimo_exame_pe > 365)."
+        },
+        {
+            field: "lacuna_DM_sem_exame_pe_180d",
+            type: "BOOLEAN",
+            desc: "DM sem exame do pé há mais de 6 meses.",
+            detail: "DM IS NOT NULL AND (data_ultimo_exame_pe IS NULL OR dias_desde_ultimo_exame_pe > 180)."
+        },
+        {
+            field: "lacuna_DM_nunca_teve_exame_pe",
+            type: "BOOLEAN",
+            desc: "DM sem registro histórico de exame dos pés.",
+            detail: "DM IS NOT NULL AND data_ultimo_exame_pe IS NULL."
+        },
+
+        { group: "Comorbidades adicionais" },
+        {
+            field: "olhos",
+            type: "DATE",
+            desc: "Data de complicação oftálmica documentada.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^(H18|H201|H2[56]|H33|H360|H4[026]|H46|H540). Inclui retinopatia, glaucoma e outras complicações oculares."
+        },
+        {
+            field: "CI",
+            type: "DATE",
+            desc: "Cardiopatia Isquêmica.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^(I2[0-5]|Z95[15]). Inclui IAM, angina e procedimentos coronários."
+        },
+        {
+            field: "ICC",
+            type: "DATE",
+            desc: "Insuficiência Cardíaca Congestiva.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^(I110|I13[02]|I42[0-9]|I43|I50|I517|P290)."
+        },
+        {
+            field: "stroke",
+            type: "DATE",
+            desc: "Acidente Vascular Cerebral (AVC).",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^(I6|G4[56]|H340)."
+        },
+        {
+            field: "vascular_periferica",
+            type: "DATE",
+            desc: "Doença Arterial Obstrutiva Periférica.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^(I7[01]|I73[189]|I77[12]|I79[02]|K55[189]|Z95[89])."
+        },
+        {
+            field: "arritmia",
+            type: "DATE",
+            desc: "Arritmias cardíacas (ex: Fibrilação Atrial).",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^(I44[1-3]|I45[69]|I4[7-9]|R00[018]|T821|Z45[05]|Z950)."
+        },
+        {
+            field: "valvular",
+            type: "DATE",
+            desc: "Doença valvular cardíaca.",
+            detail: "CTE morbidades_por_cid: MIN(entrada_data) com CID ∈ regex ^(A520|I0[5-9]|I34|I3[5-9]|Q23[0-3]|Z95[2-4])."
+        },
+        {
+            field: "tem_alcool",
+            type: "BOOLEAN",
+            desc: "Registro de uso abusivo de álcool.",
+            detail: "Derivado de morbidades_por_cid: CID ∈ regex ^(F10|E52|G621|I426|K292|K70|T51|Z502|Z714|Z721). IS NOT NULL → TRUE."
+        },
+        {
+            field: "tem_tabagismo",
+            type: "BOOLEAN",
+            desc: "Registro ativo de tabagismo.",
+            detail: "Derivado de morbidades_por_cid: CID ∈ regex ^(F17|Z716). IS NOT NULL → TRUE."
+        },
+
+        { group: "Lacunas gerais" },
+        {
+            field: "lacuna_DM_sem_HbA1c_recente",
+            type: "BOOLEAN",
+            desc: "Falta monitoramento de HbA1c recente.",
+            detail: "DM IS NOT NULL AND (data_hba1c_atual IS NULL OR dias_desde_ultima_hba1c > 180)."
+        },
+        {
+            field: "lacuna_DM_descontrolado",
+            type: "BOOLEAN",
+            desc: "DM fora da meta terapêutica.",
+            detail: "status_controle_glicemico = 'fora_da_meta'."
+        },
+        {
+            field: "lacuna_DM_hba1c_nao_solicitado",
+            type: "BOOLEAN",
+            desc: "HbA1c nunca solicitada.",
+            detail: "DM IS NOT NULL AND data_hba1c_atual IS NULL."
+        },
+        {
+            field: "lacuna_DM_microalbuminuria_nao_solicitado",
+            type: "BOOLEAN",
+            desc: "Relação albumina/creatinina pendente.",
+            detail: "DM IS NOT NULL e sem registro de microalbuminúria (verificado via códigos de exame específicos)."
+        },
+        {
+            field: "lacuna_DM_HAS_PA_descontrolada",
+            type: "BOOLEAN",
+            desc: "Paciente DM+HAS com PA elevada.",
+            detail: "DM IS NOT NULL AND HAS IS NOT NULL AND status_controle_pressorio = 'descontrolado'."
+        },
+        {
+            field: "lacuna_IMC_HAS_DM",
+            type: "BOOLEAN",
+            desc: "Falta avaliação antropométrica.",
+            detail: "(HAS IS NOT NULL OR DM IS NOT NULL) AND (peso IS NULL OR altura IS NULL OR dias_sem_medida > threshold)."
+        },
+        {
+            field: "lacuna_colesterol_HAS_DM",
+            type: "BOOLEAN",
+            desc: "Falta perfil lipídico em paciente HAS/DM.",
+            detail: "(HAS IS NOT NULL OR DM IS NOT NULL) AND colesterol_total IS NULL."
+        },
+        {
+            field: "lacuna_eas_HAS_DM",
+            type: "BOOLEAN",
+            desc: "Falta EAS (Urina tipo 1) em paciente HAS/DM.",
+            detail: "Ausência de exame de urina tipo 1 recente para pacientes HAS/DM."
+        },
+        {
+            field: "lacuna_ecg_HAS_DM",
+            type: "BOOLEAN",
+            desc: "Falta ECG de rastreio em paciente HAS/DM.",
+            detail: "Ausência de registro de ECG recente para pacientes HAS/DM."
+        },
+        {
+            field: "lacuna_PA_hipertenso_180d",
+            type: "BOOLEAN",
+            desc: "Hipertenso sem medida de PA há mais de 180 dias.",
+            detail: "HAS IS NOT NULL AND (data_ultima_pa IS NULL OR dias_desde_ultima_pa > 180)."
+        },
+        {
+            field: "lacuna_rastreio_DM_hipertenso",
+            type: "BOOLEAN",
+            desc: "Hipertenso não testado para Diabetes.",
+            detail: "HAS IS NOT NULL AND DM IS NULL AND pre_DM IS NULL AND (glicemia IS NULL E hba1c_atual IS NULL)."
+        },
+        {
+            field: "lacuna_rastreio_DM_45mais",
+            type: "BOOLEAN",
+            desc: "Paciente >45 anos não testado para Diabetes.",
+            detail: "idade >= 45 AND DM IS NULL AND pre_DM IS NULL AND (glicemia IS NULL E hba1c_atual IS NULL)."
+        },
+        {
+            field: "lacuna_HAS_descontrolado_menor80",
+            type: "BOOLEAN",
+            desc: "HAS descontrolada em paciente <80 anos.",
+            detail: "HAS IS NOT NULL AND idade < 80 AND status_controle_pressorio = 'descontrolado'."
+        },
+        {
+            field: "lacuna_HAS_descontrolado_80mais",
+            type: "BOOLEAN",
+            desc: "HAS descontrolada em idoso >80 anos.",
+            detail: "HAS IS NOT NULL AND idade >= 80 AND status_controle_pressorio = 'descontrolado' (com meta ajustada de 150 mmHg)."
+        },

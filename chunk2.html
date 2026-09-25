@@ -1,0 +1,353 @@
+<!-- ===== CONSULTA SQL ===== -->
+<section id="consulta-sql" class="section">
+    <div class="section-head">
+        <div>
+            <p class="eyebrow">Pipeline</p>
+            <h3 class="display">Consulta de Geração</h3>
+            <p class="lead">Consulta BigQuery que gera a tabela consolidada por paciente.</p>
+        </div>
+    </div>
+    <div class="mm-code">
+        <div class="mm-code__bar">
+            <span class="mm-code__file">MM_2026_novos_cadastros_stopp_start.sql</span>
+            <button class="mm-btn mm-btn--ghost-dark" id="copy-sql"><svg viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                    <path
+                        d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>Copiar código</button>
+        </div>
+        <pre id="sql-code">-- ============================================================================
+-- TABELA: MM_2026_novos_cadastros_stopp_start
+-- ============================================================================
+-- Objetivo: Consolidação por PACIENTE (1 linha/CPF) com:
+--   - Dados demográficos e de cadastro
+--   - 56 Morbidades (primeira data de diagnóstico)
+--   - HIV (base externa + CD4/CV)
+--   - Prescrições agregadas
+--   - Exames laboratoriais (perfil lipídico, glicemia, creatinina)
+--   - eGFR e estadiamento CKD
+--   - Escore de Framingham
+--   - Risco cardiovascular
+--   - Dislipidemia (CID + laboratorial)
+-- ============================================================================
+ 
+CREATE OR REPLACE TABLE `rj-sms-sandbox.sub_pav_us.MM_2026_novos_cadastros_stopp_start` AS
+ 
+WITH
+-- ============================================================================
+-- SEÇÃO 1: IDENTIFICAÇÃO DE HIV/AIDS (Base Externa + CD4/CV)
+-- ============================================================================
+hiv_cpf_raw AS (
+    SELECT
+        h.id_prontuario_global,
+        h.id_cnes,
+        h.aids_doenca_atual_ano_1_teste AS ano_diagnostico,
+        a.patient_cpf AS patient_cpf_raw,
+        REGEXP_REPLACE(CAST(a.patient_cpf AS STRING), r'\D','') AS cpf
+    FROM `rj-sms.brutos_prontuario_vitacare_historico.hiv` AS h
+    JOIN `rj-sms.brutos_prontuario_vitacare_historico.acto` AS a
+        USING (id_prontuario_global)
+    WHERE NULLIF(TRIM(CAST(a.patient_cpf AS STRING)),'') IS NOT NULL
+),
+ 
+hiv_cpf AS (
+    SELECT * FROM hiv_cpf_raw
+    WHERE LENGTH(cpf) = 11
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY cpf ORDER BY id_prontuario_global DESC
+    ) = 1
+),
+ 
+exames_hiv_cpf_raw AS (
+    SELECT
+        ea.id_hci,
+        ea.entrada_data,
+        ea.paciente_cpf AS paciente_cpf_raw,
+        er.tipo,
+        er.descricao,
+        REGEXP_REPLACE(CAST(ea.paciente_cpf AS STRING), r'\D','') AS cpf
+    FROM `rj-sms.saude_historico_clinico.episodio_assistencial` ea
+    CROSS JOIN UNNEST(ea.exames_realizados) er
+    WHERE ea.exames_realizados IS NOT NULL
+      AND ARRAY_LENGTH(ea.exames_realizados) > 0
+      AND er.descricao IS NOT NULL
+      AND REGEXP_CONTAINS(er.descricao, r'(?i)cd4|cv|carga viral')
+      AND NULLIF(TRIM(CAST(ea.paciente_cpf AS STRING)), '') IS NOT NULL
+),
+ 
+exames_hiv_cpf_last AS (
+    SELECT * FROM exames_hiv_cpf_raw
+    WHERE LENGTH(cpf) = 11
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY cpf ORDER BY entrada_data DESC, id_hci DESC
+    ) = 1
+),
+ 
+hiv_completo AS (
+    SELECT
+        h.cpf,
+        h.id_prontuario_global,
+        h.id_cnes,
+        h.ano_diagnostico,
+        e.entrada_data AS data_ultimo_exame_hiv,
+        CASE
+            WHEN h.ano_diagnostico IS NOT NULL
+                 AND SAFE_CAST(h.ano_diagnostico AS INT64) IS NOT NULL
+                 AND SAFE_CAST(h.ano_diagnostico AS INT64) >= 1980
+                 AND SAFE_CAST(h.ano_diagnostico AS INT64) <= EXTRACT(YEAR FROM CURRENT_DATE())
+            THEN DATE(SAFE_CAST(h.ano_diagnostico AS INT64), 1, 1)
+            ELSE NULL
+        END AS data_diagnostico_hiv
+    FROM hiv_cpf h
+    LEFT JOIN exames_hiv_cpf_last e USING (cpf)
+),
+ 
+-- ============================================================================
+-- SEÇÃO 2: CAPTURA DE EXAMES LABORATORIAIS (3 FONTES)
+-- ============================================================================
+exames_historico AS (
+    SELECT
+        paciente_cpf,
+        exame.codigo_do_exame AS cod_exame,
+        exame.unidade,
+        SAFE_CAST(exame.resultado AS FLOAT64) AS resultado_num,
+        SAFE_CAST(PARSE_DATETIME('%d/%m/%Y %H:%M:%S', exame.data_do_exame) AS DATE) AS data_exame
+    FROM `rj-sms.saude_historico_clinico.exame`,
+    UNNEST(exames) AS exame
+    WHERE exame.resultado IS NOT NULL
+      AND exame.codigo_do_exame IN ('CRE','COL','HDL','LDL','TRI','GLI','GLU','HGL')
+      AND paciente_cpf IS NOT NULL
+      AND SAFE_CAST(exame.resultado AS FLOAT64) > 0
+      AND SAFE_CAST(exame.resultado AS FLOAT64) < 10000
+),
+ 
+exames_cientifica AS (
+    WITH
+    solicitacoes_paciente AS (
+        SELECT
+            s.id AS solicitacao_id,
+            REGEXP_REPLACE(CAST(s.paciente_cpf AS STRING), r'\D', '') AS cpf,
+            s.unidade
+        FROM `rj-sms.brutos_cientificalab.solicitacoes` s
+        WHERE s.paciente_cpf IS NOT NULL
+          AND LENGTH(REGEXP_REPLACE(CAST(s.paciente_cpf AS STRING), r'\D', '')) = 11
+    ),
+    exames_processados AS (
+        SELECT e.id AS exame_id, e.solicitacao_id, e.cod_apoio, e.data_assinatura
+        FROM `rj-sms.brutos_cientificalab.exames` e
+        WHERE e.solicitacao_id IS NOT NULL
+          AND e.data_assinatura IS NOT NULL
+          AND e.cod_apoio IN ('CRE','COL','HDL','LDL','TRI','GLI','GLU','HGL')
+    ),
+    resultados_exames AS (
+        SELECT
+            r.exame_id,
+            r.cod_apoio,
+            r.resultado,
+            SAFE_CAST(r.resultado AS FLOAT64) AS resultado_num,
+            r.unidade
+        FROM `rj-sms.brutos_cientificalab.resultados` r
+        WHERE r.exame_id IS NOT NULL
+          AND r.resultado IS NOT NULL
+          AND r.cod_apoio IN ('CRE','COL','HDL','LDL','TRI','GLI','GLU','HGL')
+          AND SAFE_CAST(r.resultado AS FLOAT64) > 0
+          AND SAFE_CAST(r.resultado AS FLOAT64) < 10000
+    )
+    SELECT
+        sp.cpf AS paciente_cpf,
+        COALESCE(re.cod_apoio, ep.cod_apoio) AS cod_exame,
+        re.unidade,
+        re.resultado_num,
+        SAFE_CAST(ep.data_assinatura AS DATE) AS data_exame
+    FROM solicitacoes_paciente sp
+    INNER JOIN exames_processados ep ON sp.solicitacao_id = ep.solicitacao_id
+    INNER JOIN resultados_exames re ON ep.exame_id = re.exame_id
+),
+ 
+todos_exames AS (
+    SELECT * FROM exames_historico
+    UNION ALL
+    SELECT * FROM exames_cientifica
+),
+ 
+exames_filtrados AS (
+    SELECT paciente_cpf, cod_exame, resultado_num, data_exame
+    FROM todos_exames
+    WHERE
+        (cod_exame = 'COL' AND resultado_num BETWEEN 50 AND 600) OR
+        (cod_exame = 'HDL' AND resultado_num BETWEEN 10 AND 150) OR
+        (cod_exame = 'LDL' AND resultado_num BETWEEN 20 AND 400) OR
+        (cod_exame = 'TRI' AND resultado_num BETWEEN 20 AND 1000) OR
+        (cod_exame = 'GLI' AND resultado_num BETWEEN 30 AND 500) OR
+        (cod_exame = 'GLU' AND resultado_num BETWEEN 30 AND 500) OR
+        (cod_exame = 'HGL' AND resultado_num BETWEEN 3 AND 20 AND unidade = '%') OR
+        (cod_exame = 'CRE' AND resultado_num BETWEEN 0.2 AND 15 AND unidade = 'mg/dL')
+),
+ 
+exames_mais_recentes AS (
+    SELECT paciente_cpf, cod_exame, resultado_num, data_exame
+    FROM exames_filtrados
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY paciente_cpf, cod_exame ORDER BY data_exame DESC
+    ) = 1
+),
+ 
+exames_pivot AS (
+    SELECT
+        paciente_cpf AS cpf,
+        MAX(CASE WHEN cod_exame = 'CRE' THEN resultado_num END) AS creatinina,
+        MAX(CASE WHEN cod_exame = 'COL' THEN resultado_num END) AS colesterol_total,
+        MAX(CASE WHEN cod_exame = 'HDL' THEN resultado_num END) AS hdl,
+        MAX(CASE WHEN cod_exame = 'LDL' THEN resultado_num END) AS ldl,
+        MAX(CASE WHEN cod_exame = 'TRI' THEN resultado_num END) AS triglicerides,
+        COALESCE(
+            MAX(CASE WHEN cod_exame = 'GLI' THEN resultado_num END),
+            MAX(CASE WHEN cod_exame = 'GLU' THEN resultado_num END)
+        ) AS glicemia,
+        MAX(CASE WHEN cod_exame = 'HGL' THEN resultado_num END) AS hba1c,
+        MAX(CASE WHEN cod_exame = 'CRE' THEN data_exame END) AS data_creatinina,
+        MAX(CASE WHEN cod_exame = 'COL' THEN data_exame END) AS data_colesterol,
+        MAX(CASE WHEN cod_exame = 'HDL' THEN data_exame END) AS data_hdl,
+        MAX(CASE WHEN cod_exame = 'LDL' THEN data_exame END) AS data_ldl,
+        COALESCE(
+            MAX(CASE WHEN cod_exame = 'GLI' THEN data_exame END),
+            MAX(CASE WHEN cod_exame = 'GLU' THEN data_exame END)
+        ) AS data_glicemia,
+        MAX(CASE WHEN cod_exame = 'HGL' THEN data_exame END) AS data_hba1c,
+        DATE_DIFF(CURRENT_DATE(), COALESCE(
+            MAX(CASE WHEN cod_exame = 'GLI' THEN data_exame END),
+            MAX(CASE WHEN cod_exame = 'GLU' THEN data_exame END)
+        ), DAY) AS dias_desde_ultima_glicemia
+    FROM exames_mais_recentes
+    GROUP BY paciente_cpf
+),
+ 
+-- ============================================================================
+-- SEÇÃO 3: DADOS DEMOGRÁFICOS E DE CADASTRO
+-- ============================================================================
+ultima_ficha AS (
+    SELECT * FROM `rj-sms.brutos_prontuario_vitacare.ficha_a`
+    WHERE cadastro_permanente = TRUE
+      AND (situacao_usuario = 'Ativo' OR situacao_usuario IS NULL)
+      AND cpf IS NOT NULL
+      AND obito = FALSE
+      AND NOT REGEXP_CONTAINS(UPPER(COALESCE(equipe_nome, '')), r'ESB')
+      AND ine_equipe IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY cpf ORDER BY data_atualizacao_cadastro DESC
+    ) = 1
+),
+ 
+dados_paciente AS (
+    SELECT
+        f.cpf,
+        f.nome AS nome,
+        f.sexo AS genero,
+        f.data_nascimento,
+        DATE_DIFF(CURRENT_DATE(), f.data_nascimento, YEAR) AS idade,
+        f.raca_cor AS raca,
+        f.ine_equipe AS id_ine_cadastro,
+        f.equipe_nome AS nome_esf_cadastro,
+        f.unidade_cadastro AS id_cnes_cadastro,
+        f.unidade_nome AS nome_clinica_cadastro,
+        f.ap_cadastro AS area_programatica_cadastro,
+        p.equipe_saude_familia[SAFE_OFFSET(0)].medicos[SAFE_OFFSET(0)].nome
+            AS nome_medico_esf_cadastro,
+        p.equipe_saude_familia[SAFE_OFFSET(0)].enfermeiros[SAFE_OFFSET(0)].nome
+            AS nome_enfermeiro_esf_cadastro
+    FROM ultima_ficha f
+    LEFT JOIN `rj-sms.saude_historico_clinico.paciente` p ON f.cpf = p.cpf
+),
+ 
+-- ============================================================================
+-- SEÇÃO 4: MORBIDADES POR CID
+-- ============================================================================
+morbidades_base AS (
+    SELECT
+        REGEXP_REPLACE(CAST(ea.paciente_cpf AS STRING), r'\D','') AS cpf,
+        ea.entrada_data,
+        cond.id AS cid
+    FROM `rj-sms.saude_historico_clinico.episodio_assistencial` ea,
+    UNNEST(ea.condicoes) AS cond
+    WHERE ea.paciente_cpf IS NOT NULL
+      AND cond.id IS NOT NULL
+),
+ 
+morbidades_por_cid AS (
+    SELECT
+        cpf,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(I1[0-6]|O1[01])') THEN entrada_data END) AS HAS,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(E1[0-4]|O24|H360|H280|G632|G590|G990|N083|M142)') THEN entrada_data END) AS DM,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^E10') THEN cid END) AS DM_cid_raw,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(I2[0-5]|Z95[15])') THEN entrada_data END) AS CI,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(I110|I13[02]|I42[0-9]|I43|I50|I517|P290)') THEN entrada_data END) AS ICC,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(I6|G4[56]|H340)') THEN entrada_data END) AS stroke,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(I44[1-3]|I45[69]|I4[7-9]|R00[018]|T821|Z45[05]|Z950)') THEN entrada_data END) AS arritmia,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(A520|I0[5-9]|I34|I3[5-9]|Q23[0-3]|Z95[2-4])') THEN entrada_data END) AS valvular,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(I7[01]|I73[189]|I77[12]|I79[02]|K55[189]|Z95[89])') THEN entrada_data END) AS vascular_periferica,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(I120|I131|N03[2-7]|N05[2-7]|N1[89]|N250|Z49[0-2]|Z940|Z992)') THEN entrada_data END) AS IRC_por_CID,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^E78') THEN entrada_data END) AS dislipidemia_por_CID,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^E66') THEN entrada_data END) AS obesidade,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(B2[0-4]|Z21|R75|O987|P352)') THEN entrada_data END) AS SIDA,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(F10|E52|G621|I426|K292|K70|T51|Z502|Z714|Z721)') THEN entrada_data END) AS alcool,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(F17|Z716)') THEN entrada_data END) AS tabaco,
+        MIN(CASE WHEN REGEXP_CONTAINS(cid, r'^(H18|H201|H2[56]|H33|H360|H4[026]|H46|H540)') THEN entrada_data END) AS olhos
+    FROM morbidades_base
+    WHERE LENGTH(cpf) = 11 AND cpf <> '00000000000'
+    GROUP BY cpf
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY cpf ORDER BY cpf) = 1
+),
+ 
+-- [demais CTEs de HAS, DM, PA, Glicemia, Prescrições, Consultas e SELECT final omitidos por brevidade]
+-- A query completa está disponível no repositório interno do projeto.
+ 
+final AS (
+    SELECT dp.* FROM dados_paciente dp
+)
+ 
+SELECT * FROM final;</pre>
+    </div>
+</section>
+
+<!-- ===== DICIONÁRIO ===== -->
+<section id="dicionario" class="section">
+    <div class="section-head">
+        <div>
+            <p class="eyebrow">Referência</p>
+            <h3 class="display">Dicionário de Dados</h3>
+            <p class="lead">Busque pelos campos presentes na tabela final estruturada. Clique no nome de um campo para
+                copiá-lo.</p>
+        </div>
+        <label class="mm-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg><input type="search" id="search-input" placeholder="Buscar por campo, tipo ou descrição…"
+                aria-label="Buscar no dicionário"></label>
+    </div>
+    <div class="filters" id="filters" role="group" aria-label="Filtrar por tipo"></div>
+    <div class="mm-table-card">
+        <div class="mm-table-scroll">
+            <table class="mm-table">
+                <thead>
+                    <tr>
+                        <th scope="col">Campo</th>
+                        <th scope="col">Tipo</th>
+                        <th scope="col">Descrição</th>
+                        <th scope="col">Detalhes técnicos</th>
+                    </tr>
+                </thead>
+                <tbody id="dictionary-body"></tbody>
+            </table>
+        </div>
+        <div class="mm-table-foot"><span id="result-count">Carregando campos…</span><span>STRING · INTEGER · FLOAT ·
+                BOOLEAN · DATE</span></div>
+    </div>
+</section>
+
+</div>
+</main>
+
+<div id="toast" class="mm-toast" role="status" aria-live="polite"><svg viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 13l4 4L19 7" />
+    </svg><span id="toast-text"></span></div>

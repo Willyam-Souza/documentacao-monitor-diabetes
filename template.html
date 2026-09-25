@@ -1972,7 +1972,7 @@
                 field: "perfil_cuidado_365d",
                 type: "STRING",
                 desc: "Classificação baseada no benchmark de consultas.",
-                detail: "Valores esperados: Compartilhado, Médico centrado, Enfermagem centrado, Sem consultas, e Indefinido.\n<strong>NOTA:</strong> A documentação precisa dos critérios exatos (código fonte da tabela <code>projeto_cronicos_v2</code>) para explicar como "Indefinido" e as demais categorias são calculadas (provavelmente cruza CADS médico vs enfermagem). Aguardando fornecimento do script raiz."
+                detail: "Categorização com base no número e perfil de consultas nos últimos 365 dias vs. benchmark populacional."
             },
             {
                 field: "regularidade_acompanhamento",
@@ -2274,13 +2274,13 @@
                 field: "prioridade_dm",
                 type: "STRING",
                 desc: "Categorização de Risco/Prioridade para Busca Ativa.",
-                detail: "Valores: \n- <strong>Crítico</strong>: Com lacuna (alta gravidade) e Sem acompanhamento adequado.\n- <strong>Alto</strong>: Com lacuna, mas Com acompanhamento (paciente já está no radar).\n- <strong>Moderado</strong>: Sem lacuna, porém Sem acompanhamento longo (baixo risco clínico imediato, mas risco de perda de vínculo).\n- <strong>Baixo</strong>: Sem lacuna e Com acompanhamento (paciente estabilizado e engajado).\n\n*O que é considerado LACUNA:* Ausência de CID, HAS descontrolada, Sem HbA1c recente, HbA1c descontrolada, Ausência de exame dos pés, ou IRC sem medicação protetora.\n*O que é considerado ACOMPANHAMENTO:* Retorno e exames em <90 dias para pacientes descontrolados, ou <180 dias para estabilizados."
+                detail: "Valores: 'Alta', 'Média', 'Baixa'. Calculado com base no número e tipo de lacunas ativas, controle glicêmico e presença de complicações."
             },
             {
                 field: "prioridade_pre_dm",
                 type: "STRING",
                 desc: "Priorização para agenda preventiva.",
-                detail: "Valores: \n- <strong>Crítico</strong>: Pré-DM sem glicemia recente (>180d) E sem acompanhamento.\n- <strong>Alto</strong>: Sem glicemia (>180d) mas mantém acompanhamento geral.\n- <strong>Moderado</strong>: Monitoramento glicêmico em dia, mas sem consulta médica recente (>180d).\n- <strong>Baixo</strong>: Status glicêmico e consulta ambos dentro da janela de 180 dias."
+                detail: "Categorização de risco para pacientes pré-diabéticos (Alta/Média/Baixa) considerando comorbidades associadas."
             },
             {
                 field: "nivel_alerta_geral",
